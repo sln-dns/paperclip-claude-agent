@@ -1,7 +1,7 @@
 {
   "name": "paperclip",
   "description": "Live Claude Code session as an external Paperclip agent: join by invite, tasks delivered into the session, answers in the issue thread.",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "author": { "name": "sln-dns" },
   "license": "MIT",
   "keywords": ["paperclip", "agents", "mcp", "orchestration"]

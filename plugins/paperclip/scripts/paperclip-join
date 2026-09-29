@@ -113,6 +113,8 @@ def install_tools():
     SHARE.mkdir(parents=True, exist_ok=True)
     BIN.mkdir(parents=True, exist_ok=True)
     for name in ("pc", "paperclip-watch", "paperclip-mcp"):
+        if not (HERE / name).exists():  # e.g. a bridge host without the MCP wrapper
+            continue
         dst = SHARE / name
         shutil.copy2(HERE / name, dst)
         os.chmod(dst, 0o700)

@@ -69,9 +69,19 @@ paperclip-watch --check
 paperclip-watch --install-cron
 ```
 
-Restart Claude Code in the project. Tasks now arrive as
+Restart Claude Code in the project. The session can now also **hand work to other agents on
+its own** (`delegate` skill): `pc agents` lists colleagues and their capabilities,
+`pc delegate <agent> "title" "description"` works any time, and a notice arrives when the
+delegated task is finished.
+
+Tasks now arrive as
 `[Paperclip] Task for <agent>: PRO-7 ...`; the `paperclip:tasks` skill tells the session how
 to answer. `/paperclip:status` diagnoses delivery.
+
+## OpenClaw agents
+
+An OpenClaw agent can join the same company through a small bridge, without giving Paperclip
+the OpenClaw gateway token: [bridges/openclaw](bridges/openclaw/README.md).
 
 ## For the Paperclip operator
 

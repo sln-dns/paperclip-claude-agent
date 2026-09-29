@@ -5,6 +5,14 @@ Paperclip only accepts agent writes that carry an active run id (X-Paperclip-Run
 The run id comes from ~/.local/state/paperclip-watch/runs.json, kept by paperclip-watch.
 Reading needs no run: use the `paperclip` MCP server (or `pc show`).
 
+Any time (no run needed):
+  pc agents                         other agents in the company and what they can do
+  pc delegate krot "title" ["description"] [--parent=PRO-7]
+                                    give a task to another agent; you get a notice when it is done
+  pc delegated                      tasks you delegated and their status
+  pc view PRO-7                     any task: description, comments, documents (reports)
+
+Inside an active run (after a [Paperclip] notice about a task assigned to you):
   pc whoami                         agent identity (checks the key)
   pc list                           active runs
   pc show PRO-2                     task and comments
@@ -20,7 +28,12 @@ from pathlib import Path
 
 CONF = Path(os.environ.get("PAPERCLIP_CONFIG_DIR", Path.home() / ".config/paperclip")) / ".env"
 RUNS = Path.home() / ".local/state/paperclip-watch/runs.json"
-QUEUE_KEY = Path(os.environ.get("PAPERCLIP_QUEUE_KEY", Path.home() / ".ssh/paperclip_queue_ed25519"))
+DELEGATED = Path.home() / ".local/state/paperclip-watch/delegated.json"
+DEFAULT_QUEUE_KEY = Path.home() / ".ssh/paperclip_queue_ed25519"
+
+
+def queue_key(e):
+    return os.environ.get("PAPERCLIP_QUEUE_KEY") or e.get("PAPERCLIP_QUEUE_KEY") or str(DEFAULT_QUEUE_KEY)
 
 
 def env():
@@ -61,7 +74,7 @@ def call(method, path, body=None, run=None):
 
 def queue_done(run_id):
     e = env()
-    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(QUEUE_KEY),
+    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(queue_key(e)),
                     e["PAPERCLIP_QUEUE_SSH"], "done", run_id], capture_output=True, timeout=30)
 
 
@@ -79,6 +92,54 @@ def main(a):
     if cmd == "whoami":
         me = call("GET", "/api/agents/me")
         print(json.dumps({k: me.get(k) for k in ("id", "name", "role", "status", "adapterType")}, ensure_ascii=False))
+        return
+    if cmd == "agents":
+        e = env()
+        for ag in call("GET", f"/api/companies/{e['PAPERCLIP_COMPANY_ID']}/agents"):
+            if ag.get("id") == e["PAPERCLIP_AGENT_ID"] or ag.get("status") in ("terminated", "pending_approval"):
+                continue
+            print(f'{ag.get("name")}  [{ag.get("status")}]  {(ag.get("capabilities") or "—").strip()[:300]}')
+        return
+    if cmd == "delegate":
+        # Works outside runs: creating and assigning an issue does not need a run id.
+        rest = [x for x in a[1:] if not x.startswith("--parent=")]
+        parent = next((x.split("=", 1)[1] for x in a[1:] if x.startswith("--parent=")), None)
+        if len(rest) < 2:
+            sys.exit('pc: pc delegate <agent-name> "title" ["description"] [--parent=PRO-7]')
+        e = env()
+        agents = call("GET", f"/api/companies/{e['PAPERCLIP_COMPANY_ID']}/agents")
+        target = next((ag for ag in agents if ag.get("name", "").lower() == rest[0].lower()), None)
+        if not target:
+            sys.exit(f"pc: no agent named {rest[0]}; see `pc agents`")
+        body = {"title": rest[1], "assigneeAgentId": target["id"], "status": "todo", "priority": "medium"}
+        if len(rest) > 2:
+            body["description"] = text_arg(rest, 2)
+        if parent:
+            body["parentId"] = call("GET", f"/api/issues/{parent}")["id"]
+        r = call("POST", f"/api/companies/{e['PAPERCLIP_COMPANY_ID']}/issues", body)
+        d = json.loads(DELEGATED.read_text()) if DELEGATED.exists() else {}
+        d[r["id"]] = {"taskId": r["id"], "identifier": r.get("identifier"), "agent": target["name"],
+                      "title": rest[1], "since": __import__("time").time(), "notified": False}
+        DELEGATED.parent.mkdir(parents=True, exist_ok=True)
+        DELEGATED.write_text(json.dumps(d, ensure_ascii=False))
+        print(f'delegated: {r.get("identifier")} → {target["name"]}. '
+              "You will get a [Paperclip] notice in this session when it is finished; read it with pc view.")
+        return
+    if cmd == "delegated":
+        for v in (json.loads(DELEGATED.read_text()) if DELEGATED.exists() else {}).values():
+            print(f'{v["identifier"]}  → {v["agent"]}  {v.get("lastStatus", "open")}  «{v["title"]}»')
+        return
+    if cmd == "view":
+        if len(a) < 2:
+            sys.exit("pc: pc view PRO-7")
+        iss = call("GET", f"/api/issues/{a[1]}")
+        print(f'{iss.get("identifier")} [{iss.get("status")}] {iss.get("title")}\n\n{iss.get("description") or ""}\n')
+        for c in sorted(call("GET", f"/api/issues/{iss['id']}/comments") or [], key=lambda c: c.get("createdAt") or ""):
+            print(f'— {c.get("createdAt", "")[:16]}  {(c.get("body") or "")[:4000]}\n')
+        for doc in call("GET", f"/api/issues/{iss['id']}/documents") or []:
+            key = doc.get("key")
+            full = call("GET", f"/api/issues/{iss['id']}/documents/{key}")
+            print(f"=== document {key} ===\n{(full.get('body') or '')[:20000]}\n")
         return
     if cmd == "list":
         for v in runs().values():

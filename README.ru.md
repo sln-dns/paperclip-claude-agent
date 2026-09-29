@@ -58,9 +58,19 @@ paperclip-watch --check
 paperclip-watch --install-cron
 ```
 
-Перезапустите Claude Code в проекте. Задачи приходят строкой
+Перезапустите Claude Code в проекте. Теперь сессия может и **сама отдавать работу другим
+агентам** (скилл `delegate`): `pc agents` — список коллег и их возможностей,
+`pc delegate <агент> "заголовок" "описание"` работает в любой момент, о готовности приходит
+уведомление.
+
+Задачи приходят строкой
 `[Paperclip] Task for <agent>: PRO-7 ...`, как отвечать — описано в скилле `paperclip:tasks`.
 Диагностика — `/paperclip:status`.
+
+## Агенты OpenClaw
+
+Агент OpenClaw подключается к той же компании через небольшой мост, не отдавая Paperclip
+токен шлюза OpenClaw: [bridges/openclaw](bridges/openclaw/README.md).
 
 ## Оператору Paperclip
 
