@@ -1,0 +1,85 @@
+#!/usr/bin/env python3
+"""Queue resolver (root, cron every minute; four passes 15 s apart inside).
+
+For every new run in /var/lib/paperclip-handoff/<agent>/ it reads the run's context
+snapshot from the Paperclip database (task, wake reason) and writes:
+  <run>.task  task id for the run holder (or `none`);
+  <run>.ctx   JSON for the agent: task id, identifier, title, wake reason.
+Agents never need database access.
+
+Configuration: /etc/pc-handoff.conf with DATABASE_URL=postgres://... (written by install.sh).
+"""
+import json, os, re, subprocess, time
+from pathlib import Path
+
+ROOT = Path(os.environ.get("PC_HANDOFF_SPOOL", "/var/lib/paperclip-handoff"))
+CONF = Path(os.environ.get("PC_HANDOFF_CONF", "/etc/pc-handoff.conf"))
+UUID = re.compile(r"^[0-9a-f-]{36}$")
+
+
+def db_url():
+    for line in CONF.read_text().splitlines():
+        if line.startswith("DATABASE_URL="):
+            return line.split("=", 1)[1].strip()
+    raise SystemExit(f"DATABASE_URL is missing in {CONF}")
+
+
+def query(url, runs):
+    ids = ",".join(f"'{r}'" for r in runs)  # every id matched UUID above
+    sql = (
+        "select r.id, coalesce(r.context_snapshot->>'taskId',''), "
+        "coalesce(r.context_snapshot->>'wakeReason',''), coalesce(i.identifier,''), coalesce(i.title,'') "
+        "from heartbeat_runs r left join issues i on i.id::text = r.context_snapshot->>'taskId' "
+        f"where r.id in ({ids})"
+    )
+    out = subprocess.run(["psql", url, "-tA", "-F", "\x1f", "-c", sql], capture_output=True, text=True, timeout=30)
+    if out.returncode != 0:
+        raise RuntimeError(out.stderr[:200])
+    res = {}
+    for line in out.stdout.splitlines():
+        p = line.split("\x1f")
+        if len(p) == 5:
+            res[p[0]] = {"taskId": p[1], "wakeReason": p[2], "identifier": p[3], "title": p[4]}
+    return res
+
+
+def write(path, text):
+    path.write_text(text)
+    st = path.parent.stat()
+    os.chown(path, st.st_uid, st.st_gid)
+    os.chmod(path, 0o660)
+
+
+def one_pass(url):
+    if not ROOT.exists():
+        return
+    pending = {}
+    for agent_dir in ROOT.iterdir():
+        if agent_dir.is_dir():
+            for f in agent_dir.glob("*.json"):
+                if UUID.match(f.stem) and not (agent_dir / f"{f.stem}.task").exists():
+                    pending[f.stem] = agent_dir
+    if not pending:
+        return
+    ctx = query(url, list(pending))
+    for run, d in pending.items():
+        c = ctx.get(run)
+        if c is None:
+            continue  # the run row is not visible yet; next pass
+        write(d / f"{run}.ctx", json.dumps({"runId": run, **c}, ensure_ascii=False))
+        write(d / f"{run}.task", (c["taskId"] or "none") + "\n")
+
+
+def main():
+    url = db_url()
+    for i in range(4):
+        try:
+            one_pass(url)
+        except Exception as ex:
+            print("resolve:", ex)
+        if i < 3:
+            time.sleep(15)
+
+
+if __name__ == "__main__":
+    main()

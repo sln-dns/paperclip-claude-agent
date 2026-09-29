@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "paperclip": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/scripts/paperclip-mcp"
+    }
+  }
+}

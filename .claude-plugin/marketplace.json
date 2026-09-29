@@ -1,0 +1,13 @@
+{
+  "name": "paperclip-claude-agent",
+  "owner": { "name": "sln-dns" },
+  "description": "Connect a live Claude Code session to Paperclip as an external agent",
+  "plugins": [
+    {
+      "name": "paperclip",
+      "description": "Join a Paperclip company as an external agent, get tasks delivered into your live Claude Code session, and answer in the issue thread.",
+      "source": "./plugins/paperclip",
+      "category": "productivity"
+    }
+  ]
+}

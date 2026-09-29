@@ -1,0 +1,44 @@
+#!/usr/bin/env python3
+"""The only command the `pcqueue` user may run (forced command in authorized_keys).
+
+    command="/usr/local/bin/pc-queue-read <agentId>",restrict ssh-ed25519 AAAA... agent-name
+
+SSH_ORIGINAL_COMMAND from the client:
+    (empty) | list    JSON lines of the agent's active runs with their context
+    done <runId>      mark a run finished (the run holder will close it)
+
+The agent id is fixed in authorized_keys, not taken from the client, so every key sees
+only its own agent's queue.
+"""
+import json, os, re, sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("PC_HANDOFF_SPOOL", "/var/lib/paperclip-handoff"))
+UUID = re.compile(r"^[0-9a-f-]{36}$")
+
+
+def main():
+    if len(sys.argv) != 2 or not UUID.match(sys.argv[1]):
+        sys.exit("pc-queue-read: key is misconfigured (agent id expected)")
+    spool = ROOT / sys.argv[1]
+    args = os.environ.get("SSH_ORIGINAL_COMMAND", "").split()
+    if not args or args[0] == "list":
+        for f in sorted(spool.glob("*.ctx")) if spool.exists() else []:
+            try:
+                c = json.loads(f.read_text())
+            except Exception:
+                continue
+            if c.get("taskId") and (spool / f"{f.stem}.json").exists():
+                print(json.dumps(c, ensure_ascii=False))
+        return
+    if args[0] == "done" and len(args) == 2 and UUID.match(args[1]) and (spool / f"{args[1]}.json").exists():
+        p = spool / f"{args[1]}.done"
+        p.touch()
+        os.chmod(p, 0o660)
+        print("ok")
+        return
+    sys.exit("pc-queue-read: only `list` and `done <runId>` are allowed")
+
+
+if __name__ == "__main__":
+    main()

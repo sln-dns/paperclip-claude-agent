@@ -1,0 +1,187 @@
+#!/usr/bin/env python3
+"""Join a Paperclip company as an external agent backed by a live Claude Code session.
+
+    paperclip-join "<invite prompt text or invite URL>" [options]
+    paperclip-join --claim            # resume: claim the key after approval
+
+Options:
+    --name NAME               agent name in Paperclip (default: $USER-claude)
+    --capabilities TEXT       what the board should assign to this agent
+    --handoff-command PATH    run holder on the Paperclip host (default /usr/local/bin/pc-handoff)
+    --queue-ssh USER@HOST     queue access (default pcqueue@<Paperclip host>)
+    --tmux-target TARGET      tmux target of the live session (default: current tmux pane's session)
+    --wait MINUTES            how long to wait for board approval (default 30)
+
+Steps: submit the join request with adapter `process` (the run holder), wait for board
+approval, claim the agent API key once, store it in ~/.config/paperclip/.env (0600),
+create a queue ssh key, install `pc` and `paperclip-watch` into ~/.local/bin, and print
+the line the Paperclip operator must add with server/add-agent.sh.
+"""
+import argparse, json, os, re, shutil, subprocess, sys, time, urllib.error, urllib.request
+from pathlib import Path
+from urllib.parse import urlparse
+
+CONF_DIR = Path(os.environ.get("PAPERCLIP_CONFIG_DIR", Path.home() / ".config/paperclip"))
+ENV = CONF_DIR / ".env"
+JOIN = CONF_DIR / "join.json"
+QUEUE_KEY = Path(os.environ.get("PAPERCLIP_QUEUE_KEY", Path.home() / ".ssh/paperclip_queue_ed25519"))
+HERE = Path(__file__).resolve().parent
+SHARE = Path.home() / ".local/share/paperclip-agent"
+BIN = Path.home() / ".local/bin"
+INVITE = re.compile(r"(https?://[^\s\"'<>]+?)/api/invites/(pcp_invite_[A-Za-z0-9_-]+)")
+
+
+def http(method, url, body=None, headers=None, timeout=30):
+    h = {"Content-Type": "application/json", **(headers or {})}
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers=h, method=method)
+    try:
+        r = urllib.request.urlopen(req, timeout=timeout)
+        txt = r.read().decode()
+        return r.status, (json.loads(txt) if txt else {})
+    except urllib.error.HTTPError as ex:
+        txt = ex.read().decode(errors="replace")
+        try:
+            return ex.code, json.loads(txt)
+        except Exception:
+            return ex.code, {"error": txt[:300]}
+
+
+def reachable_base(text):
+    found = INVITE.findall(text)
+    if not found:
+        sys.exit("paperclip-join: no /api/invites/<token> URL found in the invite")
+    token = found[0][1]
+    for base, _ in found:
+        try:
+            code, body = http("GET", f"{base}/api/health", timeout=8)
+            if code == 200 and body.get("status") == "ok":
+                return base, token
+        except Exception:
+            continue
+    sys.exit("paperclip-join: none of the invite URLs is reachable; ask the operator for a reachable hostname")
+
+
+def write_private(path, text):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(path.parent, 0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+
+
+def submit(args):
+    text = args.invite
+    if os.path.exists(text):
+        text = Path(text).read_text()
+    base, token = reachable_base(text)
+    body = {
+        "requestType": "agent",
+        "agentName": args.name,
+        "adapterType": "process",
+        "capabilities": args.capabilities,
+        "agentDefaultsPayload": {"command": args.handoff_command, "timeoutSec": 3600},
+        "paperclipApiUrl": base,
+    }
+    code, resp = http("POST", f"{base}/api/invites/{token}/accept", body)
+    if code not in (200, 201, 202) or "claimSecret" not in resp:
+        sys.exit(f"paperclip-join: join request failed: HTTP {code} {json.dumps(resp)[:300]}")
+    state = {
+        "base": base, "requestId": resp["id"], "companyId": resp["companyId"],
+        "claimSecret": resp["claimSecret"], "claimPath": resp["claimApiKeyPath"],
+        "name": args.name, "queueSsh": args.queue_ssh or f"pcqueue@{urlparse(base).hostname}",
+        "tmuxTarget": args.tmux_target,
+    }
+    write_private(JOIN, json.dumps(state))
+    print(f"Join request {resp['id']} submitted for agent '{args.name}' (status: {resp.get('status')}).")
+    print("Ask a board operator to approve it in Paperclip. Waiting...")
+    return state
+
+
+def claim(state, wait_minutes):
+    deadline = time.time() + wait_minutes * 60
+    while True:
+        code, resp = http("POST", state["base"] + state["claimPath"], {"claimSecret": state["claimSecret"]})
+        if code in (200, 201) and resp.get("token"):
+            return resp
+        if time.time() > deadline:
+            sys.exit(f"paperclip-join: not approved yet (HTTP {code}). Run `paperclip-join --claim` after approval.")
+        time.sleep(20)
+
+
+def install_tools():
+    SHARE.mkdir(parents=True, exist_ok=True)
+    BIN.mkdir(parents=True, exist_ok=True)
+    for name in ("pc", "paperclip-watch", "paperclip-mcp"):
+        dst = SHARE / name
+        shutil.copy2(HERE / name, dst)
+        os.chmod(dst, 0o700)
+        link = BIN / name
+        if link.is_symlink() or link.exists():
+            link.unlink()
+        link.symlink_to(dst)
+
+
+def queue_key():
+    if not QUEUE_KEY.exists():
+        subprocess.run(["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-C", "paperclip-queue",
+                        "-f", str(QUEUE_KEY)], check=True)
+    return QUEUE_KEY.with_suffix(".pub").read_text().strip()
+
+
+def finish(state, resp):
+    token = resp["token"]
+    if "..." in token or "redacted" in token.lower():
+        sys.exit("paperclip-join: got a masked token; do not store it")
+    code, me = http("GET", state["base"] + "/api/agents/me", headers={"Authorization": f"Bearer {token}"})
+    if code != 200:
+        sys.exit(f"paperclip-join: the new key does not authenticate (HTTP {code})")
+    env = (
+        f"PAPERCLIP_API_URL={state['base']}\n"
+        f"PAPERCLIP_API_KEY={token}\n"
+        f"PAPERCLIP_COMPANY_ID={me['companyId']}\n"
+        f"PAPERCLIP_AGENT_ID={me['id']}\n"
+        f"PAPERCLIP_AGENT_NAME={me.get('name') or state['name']}\n"
+        f"PAPERCLIP_QUEUE_SSH={state['queueSsh']}\n"
+        f"PAPERCLIP_TMUX_TARGET={state.get('tmuxTarget') or ''}\n"
+    )
+    write_private(ENV, env)
+    JOIN.unlink(missing_ok=True)
+    install_tools()
+    pub = queue_key()
+    print(f"\nJoined as '{me.get('name')}' ({me['id']}). Key stored in {ENV} (0600).")
+    print("\nSend this to the Paperclip operator (run on the Paperclip host as root):\n")
+    print(f"  sudo ./server/add-agent.sh {me['id']} '{pub}'\n")
+    print("Then:")
+    print("  paperclip-watch --check         # queue access works")
+    print("  paperclip-watch --install-cron  # deliver tasks into the tmux session every 2 minutes")
+    print("  restart Claude Code in the project so the `paperclip` MCP server starts")
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("invite", nargs="?")
+    p.add_argument("--claim", action="store_true")
+    p.add_argument("--name", default=f"{os.environ.get('USER', 'agent')}-claude")
+    p.add_argument("--capabilities", default="Live Claude Code session. Takes tasks from Paperclip and answers in the issue thread.")
+    p.add_argument("--handoff-command", default="/usr/local/bin/pc-handoff")
+    p.add_argument("--queue-ssh")
+    p.add_argument("--tmux-target", default=os.environ.get("TMUX_PANE") and subprocess.run(
+        ["tmux", "display-message", "-p", "#S"], capture_output=True, text=True).stdout.strip())
+    p.add_argument("--wait", type=int, default=30)
+    a = p.parse_args()
+    if a.claim:
+        if not JOIN.exists():
+            sys.exit(f"paperclip-join: no pending join request ({JOIN} missing)")
+        state = json.loads(JOIN.read_text())
+    else:
+        if not a.invite:
+            p.error("invite text or URL is required")
+        if ENV.exists():
+            sys.exit(f"paperclip-join: {ENV} already exists; this agent has already joined")
+        state = submit(a)
+    finish(state, claim(state, a.wait))
+
+
+if __name__ == "__main__":
+    main()

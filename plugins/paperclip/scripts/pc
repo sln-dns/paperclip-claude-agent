@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""pc — write to Paperclip as this agent, inside an active run.
+
+Paperclip only accepts agent writes that carry an active run id (X-Paperclip-Run-Id).
+The run id comes from ~/.local/state/paperclip-watch/runs.json, kept by paperclip-watch.
+Reading needs no run: use the `paperclip` MCP server (or `pc show`).
+
+  pc whoami                         agent identity (checks the key)
+  pc list                           active runs
+  pc show PRO-2                     task and comments
+  pc checkout PRO-2                 claim the task
+  pc comment PRO-2 "text"           comment (text, or "-" for stdin)
+  pc status PRO-2 in_review "text"  change status with a comment
+  pc done PRO-2 ["text"]            close the task and release the run
+  pc release PRO-2                  give the task back
+  pc subtask PRO-2 <agent> "title" ["description"]   delegate: create a child task for another agent
+"""
+import json, os, subprocess, sys, urllib.error, urllib.request
+from pathlib import Path
+
+CONF = Path(os.environ.get("PAPERCLIP_CONFIG_DIR", Path.home() / ".config/paperclip")) / ".env"
+RUNS = Path.home() / ".local/state/paperclip-watch/runs.json"
+QUEUE_KEY = Path(os.environ.get("PAPERCLIP_QUEUE_KEY", Path.home() / ".ssh/paperclip_queue_ed25519"))
+
+
+def env():
+    e = {}
+    for line in CONF.read_text().splitlines():
+        if "=" in line and not line.startswith("#"):
+            k, v = line.split("=", 1)
+            e[k.strip()] = v.strip()
+    return e
+
+
+def runs():
+    return json.loads(RUNS.read_text()) if RUNS.exists() else {}
+
+
+def find(ref):
+    cand = [v for v in runs().values() if ref in (v["identifier"], v["taskId"])]
+    if cand:
+        return max(cand, key=lambda v: v.get("since") or 0)  # newest live run of the task
+    sys.exit(f"pc: no active run for {ref}. You can only write to a task you were woken for; "
+             "if the run ended, a new one starts on the next assignment or mention.")
+
+
+def call(method, path, body=None, run=None):
+    e = env()
+    h = {"Authorization": "Bearer " + e["PAPERCLIP_API_KEY"], "Content-Type": "application/json"}
+    if run:
+        h["X-Paperclip-Run-Id"] = run
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(e["PAPERCLIP_API_URL"] + path, data=data, headers=h, method=method)
+    try:
+        r = urllib.request.urlopen(req, timeout=30)
+        txt = r.read().decode()
+        return json.loads(txt) if txt else {}
+    except urllib.error.HTTPError as ex:
+        sys.exit(f"pc: HTTP {ex.code} {method} {path}: {ex.read().decode(errors='replace')[:400]}")
+
+
+def queue_done(run_id):
+    e = env()
+    subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-i", str(QUEUE_KEY),
+                    e["PAPERCLIP_QUEUE_SSH"], "done", run_id], capture_output=True, timeout=30)
+
+
+def text_arg(a, i):
+    if len(a) <= i:
+        return None
+    return sys.stdin.read() if a[i] == "-" else a[i]
+
+
+def main(a):
+    if not a or a[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    cmd = a[0]
+    if cmd == "whoami":
+        me = call("GET", "/api/agents/me")
+        print(json.dumps({k: me.get(k) for k in ("id", "name", "role", "status", "adapterType")}, ensure_ascii=False))
+        return
+    if cmd == "list":
+        for v in runs().values():
+            print(f'{v["identifier"]}  run={v["runId"][:8]}  {v["wakeReason"]}  «{v["title"]}»')
+        return
+    if len(a) < 2:
+        sys.exit("pc: task reference expected, e.g. PRO-2")
+    v = find(a[1])
+    tid, run = v["taskId"], v["runId"]
+    if cmd == "show":
+        iss = call("GET", f"/api/issues/{tid}")
+        print(json.dumps({k: iss.get(k) for k in ("identifier", "title", "status", "description")}, ensure_ascii=False, indent=1))
+        for c in call("GET", f"/api/issues/{tid}/comments") or []:
+            print("—", c.get("authorAgentId") or c.get("authorUserId"), ":", (c.get("body") or "")[:2000])
+    elif cmd == "checkout":
+        r = call("POST", f"/api/issues/{tid}/checkout",
+                 {"agentId": env()["PAPERCLIP_AGENT_ID"],
+                  "expectedStatuses": ["todo", "backlog", "blocked", "in_review", "in_progress"]}, run)
+        print("checked out:", r.get("identifier"), r.get("status"))
+    elif cmd == "comment":
+        body = text_arg(a, 2) or sys.exit("pc: comment text expected")
+        call("POST", f"/api/issues/{tid}/comments", {"body": body}, run)
+        print("comment added")
+    elif cmd in ("status", "done"):
+        status = "done" if cmd == "done" else (a[2] if len(a) > 2 else sys.exit("pc: status expected"))
+        comment = text_arg(a, 2 if cmd == "done" else 3)
+        body = {"status": status}
+        if comment:
+            body["comment"] = comment
+        r = call("PATCH", f"/api/issues/{tid}", body, run)
+        print("status:", r.get("status"))
+        if status not in ("todo", "backlog", "in_progress"):
+            for other in [x["runId"] for x in runs().values() if x["taskId"] == tid]:
+                queue_done(other)
+    elif cmd == "release":
+        call("POST", f"/api/issues/{tid}/release", {}, run)
+        print("released")
+    elif cmd == "subtask":
+        if len(a) < 4:
+            sys.exit('pc: pc subtask PRO-2 <agent-name> "title" ["description"]')
+        e = env()
+        body = {"title": a[3], "parentId": tid, "status": "todo", "assigneeAgentId": a[2]}
+        if len(a) > 4:
+            body["description"] = a[4]
+        r = call("POST", f"/api/companies/{e['PAPERCLIP_COMPANY_ID']}/issues", body, run)
+        print("created:", r.get("identifier"), "→", a[2])
+    else:
+        sys.exit(f"pc: unknown command {cmd}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

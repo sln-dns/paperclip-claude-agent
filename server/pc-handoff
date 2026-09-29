@@ -1,0 +1,80 @@
+#!/usr/bin/env python3
+"""Run holder for an external Paperclip agent (the `process` adapter command).
+
+Paperclip runs this command on every wake of the agent. The `process` adapter passes only
+the run id, not the task, so the holder drops the run id into the agent's queue and waits
+for the resolver (pc-handoff-resolve, root cron on this host) to write `<run>.task`.
+While the task is in a working status the holder keeps the run open, so the external
+Claude Code session can write to Paperclip with this run id (Paperclip only accepts agent
+writes that carry an active run id).
+
+The holder exits when the task leaves the working statuses, when the agent drops
+`<run>.done` into the queue, or after PC_HANDOFF_MAX_WAIT seconds.
+"""
+import json, os, sys, time, urllib.request
+from pathlib import Path
+
+ROOT = Path(os.environ.get("PC_HANDOFF_SPOOL", "/var/lib/paperclip-handoff"))
+MAX_WAIT = int(os.environ.get("PC_HANDOFF_MAX_WAIT", "3300"))
+TASK_WAIT = int(os.environ.get("PC_HANDOFF_TASK_WAIT", "180"))
+POLL = 15
+WORKING = {"todo", "backlog", "in_progress"}
+
+
+def issue_status(task):
+    url = os.environ.get("PAPERCLIP_API_URL", "http://127.0.0.1:3100").rstrip("/")
+    url += "" if url.endswith("/api") else "/api"
+    req = urllib.request.Request(
+        f"{url}/issues/{task}",
+        headers={"Authorization": "Bearer " + os.environ.get("PAPERCLIP_API_KEY", "")},
+    )
+    return json.load(urllib.request.urlopen(req, timeout=20)).get("status")
+
+
+def main():
+    os.umask(0o007)
+    agent = os.environ.get("PAPERCLIP_AGENT_ID", "unknown")
+    run = os.environ.get("PAPERCLIP_RUN_ID") or str(int(time.time()))
+    spool = ROOT / agent
+    spool.mkdir(parents=True, exist_ok=True)
+    f, ftask, fdone = spool / f"{run}.json", spool / f"{run}.task", spool / f"{run}.done"
+    f.write_text(json.dumps({"runId": run, "agentId": agent, "createdAt": time.time()}))
+    print(f"handoff: run {run} queued", flush=True)
+    start = time.time()
+    try:
+        task = None
+        while time.time() - start < TASK_WAIT:
+            if ftask.exists():
+                task = ftask.read_text().strip()
+                break
+            time.sleep(3)
+        if not task or task == "none":
+            print(f"handoff: no task for this run ({task or 'resolver did not answer'}), closing", flush=True)
+            return 0
+        print(f"handoff: task {task}, holding the run", flush=True)
+        status = None
+        while time.time() - start < MAX_WAIT:
+            if fdone.exists():
+                print("handoff: agent reported completion", flush=True)
+                break
+            try:
+                status = issue_status(task)
+            except Exception as ex:  # keep holding on transient API errors
+                print(f"handoff: cannot read task: {ex}", flush=True)
+            if status and status not in WORKING:
+                print(f"handoff: task is {status}, closing", flush=True)
+                break
+            time.sleep(POLL)
+        else:
+            print(f"handoff: time limit {MAX_WAIT}s reached, task status {status}", flush=True)
+    finally:
+        for p in (f, ftask, fdone, spool / f"{run}.ctx"):
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

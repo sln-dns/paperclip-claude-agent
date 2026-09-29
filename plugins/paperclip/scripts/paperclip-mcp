@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Start the official Paperclip MCP server with this agent's key.
+# The key lives in ~/.config/paperclip/.env (0600, written by paperclip-join); it never
+# goes into Claude Code settings. The server version is pinned; bump it deliberately.
+set -euo pipefail
+CONF="${PAPERCLIP_CONFIG_DIR:-$HOME/.config/paperclip}/.env"
+if [ ! -f "$CONF" ]; then
+  echo "paperclip-mcp: $CONF not found — run /paperclip:join first" >&2
+  exit 1
+fi
+set -a; . "$CONF"; set +a
+exec npx -y @paperclipai/mcp-server@${PAPERCLIP_MCP_VERSION:-2026.916.1}
